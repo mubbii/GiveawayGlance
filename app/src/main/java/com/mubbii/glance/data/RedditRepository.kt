@@ -10,7 +10,7 @@ import org.json.JSONObject
  * subreddit for the weekly "Code Giveaway" thread and surface the newest
  * match, same idea as replacing a hardcoded URL with dynamic search.
  *
- * NOTE: this hits Reddit's public read-only JSON endpoint (www.reddit.com/*.json),
+ * NOTE: this hits Reddit's public read-only JSON endpoint (a www.reddit.com URL ending in .json),
  * no login needed. Reddit has tightened rate limits / bot detection on this
  * endpoint over time — if you start getting empty results or 403s, the fix is
  * to switch this to proper OAuth (script app, same credential flow PRAW uses
