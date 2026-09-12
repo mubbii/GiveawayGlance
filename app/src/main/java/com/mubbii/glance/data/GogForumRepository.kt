@@ -3,24 +3,27 @@ package com.mubbii.glance.data
 import com.mubbii.glance.model.GiveawayItem
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeParseException
+import java.util.Locale
 
 /**
- * Scrapes any GOG forum thread of this shape. Confirmed live against the
- * "Free (temporary) keys giveaway central topic." thread: the base thread
- * URL (no page number) redirects to the CURRENT last page automatically,
- * and every post has a permalink like .../postNNNNN where NNNNN is a
- * strictly-increasing post id. So "fetch the base URL, take the highest
- * post id on the resulting page" reliably gives the newest post without
- * tracking page numbers yourself. Ninja Giveaway 2.0 is the same GOG forum
- * software, same URL shape, so this class is reused for both rather than
- * writing a second near-identical one.
+ * Scrapes a GOG forum thread. Built from real saved HTML of the "Ninja
+ * Giveaway 2.0" thread (not guessed), so selectors are precise:
+ * - each real post is `div.big_post_h`
+ * - its permalink/id is in `div.post_nr a[href]`, href ending in
+ *   `/post<id>` (no hyphen, unlike IndieGala's `/post-<id>`)
+ * - the post date is plain text in `div.post_date`, formatted like
+ *   "Posted August 17, 2026"
+ * - the author name is in `div.b_u_name`
+ * - the body text is in `div.post_text_c` — this can contain a nested
+ *   quoted-post block (`div.quot`), which is stripped before reading the
+ *   text so replies don't just repeat whatever they quoted
  *
- * NOTE ON SNIPPETS: the post-id detection is solid (that part's confirmed),
- * but pulling clean text out of the surrounding HTML (`extractSnippet`) is
- * a best-effort DOM walk since I only had a text-extracted view of the page,
- * not the raw class names. If a snippet looks empty or garbled, open the
- * thread in desktop Chrome -> View Source, find the div wrapping one post,
- * and tighten `extractSnippet` to match it.
+ * The base thread URL redirects to the current last page automatically
+ * (confirmed live), so this is a single fetch — no separate pagination
+ * step needed, unlike IndieGala's XenForo forum.
  */
 class GogForumRepository(
     override val key: String,
@@ -30,46 +33,65 @@ class GogForumRepository(
 
     companion object {
         private val POST_ID_REGEX = Regex(""".*/post(\d+)$""")
+        private val DATE_FORMATTER = DateTimeFormatter
+            .ofPattern("'Posted' MMMM d, yyyy", Locale.ENGLISH)
     }
 
     override fun fetchLatest(): List<GiveawayItem> {
-        // Jsoup follows the redirect to the current last page automatically.
         val doc = Jsoup.connect(threadUrl)
             .userAgent("Mozilla/5.0 (Android) GiveawayGlance/1.0")
             .timeout(15_000)
             .get()
 
-        val postLinks = doc.select("a[href]").filter { el ->
-            POST_ID_REGEX.matches(el.attr("href"))
+        val posts = doc.select("div.big_post_h")
+        if (posts.isEmpty()) return emptyList()
+
+        var bestPost: Element? = null
+        var bestId = -1L
+        var bestUrl: String? = null
+
+        for (post in posts) {
+            val idLink = post.select("div.post_nr a[href]").firstOrNull() ?: continue
+            val match = POST_ID_REGEX.find(idLink.attr("href")) ?: continue
+            val id = match.groupValues[1].toLongOrNull() ?: continue
+            if (id > bestId) {
+                bestId = id
+                bestPost = post
+                bestUrl = idLink.absUrl("href")
+            }
         }
-        if (postLinks.isEmpty()) return emptyList()
 
-        val latestLink = postLinks.maxByOrNull { el ->
-            POST_ID_REGEX.find(el.attr("href"))!!.groupValues[1].toLong()
-        } ?: return emptyList()
+        val post = bestPost ?: return emptyList()
+        val url = bestUrl ?: threadUrl
 
-        val postId = POST_ID_REGEX.find(latestLink.attr("href"))!!.groupValues[1]
-        val snippet = extractSnippet(latestLink)
+        val author = post.select("div.b_u_name").firstOrNull()?.text()?.trim() ?: "unknown"
+
+        val dateText = post.select("div.post_date").firstOrNull()?.text()?.trim()
+        val postedAt = dateText?.let { parsePostedDate(it) }
+
+        val bodyEl = post.select("div.post_text_c").firstOrNull()?.clone()
+        bodyEl?.select("div.quot")?.remove() // drop quoted-post blocks
+        val bodyText = bodyEl?.text()?.trim()?.take(240)
+            ?.ifBlank { null } ?: "Tap to view the new post"
 
         return listOf(
             GiveawayItem(
                 sourceName = name,
-                id = postId,
-                title = "New post in giveaway thread",
-                snippet = snippet,
-                url = latestLink.absUrl("href")
+                id = bestId.toString(),
+                title = "New post by $author",
+                snippet = bodyText,
+                url = url,
+                postedAt = postedAt
             )
         )
     }
 
-    /** Best-effort: walk up from the post-id anchor to a reasonably sized text block. */
-    private fun extractSnippet(anchor: Element): String {
-        var node: Element? = anchor
-        repeat(6) {
-            node = node?.parent()
-            val text = node?.text()?.trim().orEmpty()
-            if (text.length in 20..400) return text
+    /** GOG shows dates like "Posted August 17, 2026" with no time of day. */
+    private fun parsePostedDate(text: String): String? =
+        try {
+            val date = LocalDate.parse(text, DATE_FORMATTER)
+            date.format(DateTimeFormatter.ofPattern("MMM d, yyyy", Locale.ENGLISH))
+        } catch (e: DateTimeParseException) {
+            null
         }
-        return node?.text()?.take(200)?.trim().orEmpty().ifBlank { "Tap to view the new post" }
-    }
 }

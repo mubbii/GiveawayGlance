@@ -7,6 +7,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -14,27 +15,35 @@ import java.time.format.DateTimeParseException
 
 /**
  * Lenovo's "Game Key Drops" page (gaming.lenovo.com/game-key-drops) is a
- * scheduled-event board, not a forum you post in — you can't win anything
- * here, the point is just knowing WHEN the next drop happens, since Lenovo
- * sometimes shows a date and sometimes just says "Coming Soon" with no date
- * yet. So this returns every currently Active or Coming Soon drop (there
- * can be more than one at once), each with its real start date if Lenovo
- * has published one.
+ * scheduled-event board, not a forum you post in — the point is knowing
+ * WHEN the next drop happens, since Lenovo sometimes shows a date and
+ * sometimes just says "Coming Soon" with none yet.
  *
- * This was reverse-engineered from a live browser session (not guessed):
- * the page runs on the Bettermode community platform, backed by a GraphQL
- * API at api.bettermode.com. Getting data out takes two calls:
+ * IMPORTANT: Lenovo's own `status` field ("Active"/"Coming Soon"/"Expired")
+ * does NOT reliably track real-world timing — some drops (e.g. recurring
+ * "restocked" currency/item pools) stay marked Active long after their
+ * listed date has passed, since that field is set manually on their end,
+ * not derived from the date. So this does NOT trust `status` to decide
+ * what's current. Instead it fetches every non-Expired-looking post,
+ * computes each one's own end-of-relevance instant from its own
+ * start_date/end_date fields, and drops anything whose date has already
+ * passed — regardless of what Lenovo's status field claims.
+ *
+ * It also excludes recurring in-game-currency/item drops by title keyword
+ * (see EXCLUDED_TITLE_KEYWORDS) since those aren't the single-game key
+ * giveaways you're after.
+ *
+ * Reverse-engineered from a live browser session (not guessed): the page
+ * runs on the Bettermode community platform, backed by a GraphQL API at
+ * api.bettermode.com. Getting data out takes two calls:
  *
  * 1. `Tokens` query with just `networkDomain` — no login needed, hands
- *    back a short-lived anonymous/guest access token (confirmed live:
- *    the token in the captured session expired in 5 minutes). This is the
- *    same thing the site itself does for a logged-out visitor.
+ *    back a short-lived anonymous/guest access token.
  * 2. `GetPosts` query, sent with that token as `Authorization: Bearer`,
- *    filtered to this specific post type + space + status.
+ *    filtered to this specific post type + space.
  *
- * The status/space/post-type IDs below are Lenovo's real, fixed IDs
- * (confirmed from a live captured request) — they're opaque internal IDs,
- * not something this app invents or guesses.
+ * The space/post-type/status IDs below are Lenovo's real, fixed IDs
+ * confirmed from a live captured request.
  */
 class LenovoRepository(private val client: OkHttpClient) : GiveawaySource {
 
@@ -50,6 +59,12 @@ class LenovoRepository(private val client: OkHttpClient) : GiveawaySource {
         // Real option IDs for the "status" custom field on this post type.
         private const val STATUS_ACTIVE = "AmAI_EO502mWht5Fb6OE0"
         private const val STATUS_COMING_SOON = "X7FhO8Z5w0QXFFnoFHVpZ"
+        private const val STATUS_EXPIRED = "vFkvw3-q42NRPSbfq26kG"
+
+        // Case-insensitive title keywords to skip — recurring reward pools,
+        // not single-game key giveaways. Add more here if new categories
+        // like this show up.
+        private val EXCLUDED_TITLE_KEYWORDS = listOf("currency")
 
         private const val TOKENS_QUERY = """
             query Tokens(${'$'}networkDomain: String) {
@@ -86,7 +101,7 @@ class LenovoRepository(private val client: OkHttpClient) : GiveawaySource {
 
     override fun fetchLatest(): List<GiveawayItem> {
         val accessToken = fetchGuestAccessToken() ?: return emptyList()
-        return fetchActiveAndUpcomingDrops(accessToken)
+        return fetchUpcomingDrops(accessToken)
     }
 
     private fun fetchGuestAccessToken(): String? {
@@ -104,7 +119,9 @@ class LenovoRepository(private val client: OkHttpClient) : GiveawaySource {
             ?.takeIf { it.isNotBlank() }
     }
 
-    private fun fetchActiveAndUpcomingDrops(accessToken: String): List<GiveawayItem> {
+    private fun fetchUpcomingDrops(accessToken: String): List<GiveawayItem> {
+        // Ask for everything that isn't explicitly Expired — we still do
+        // our own date filtering below rather than trusting this alone.
         val filterBy = JSONArray().put(
             JSONObject().apply {
                 put("keyString", "fields.status")
@@ -115,7 +132,7 @@ class LenovoRepository(private val client: OkHttpClient) : GiveawaySource {
         val variables = JSONObject().apply {
             put("spaceIds", JSONArray().put(SPACE_ID))
             put("postTypeIds", JSONArray().put(POST_TYPE_ID))
-            put("limit", 10)
+            put("limit", 20)
             put("orderByString", "fields.start_date")
             put("reverse", false)
             put("filterBy", filterBy)
@@ -133,27 +150,56 @@ class LenovoRepository(private val client: OkHttpClient) : GiveawaySource {
             ?.optJSONArray("nodes")
             ?: return emptyList()
 
+        val now = Instant.now()
         val items = mutableListOf<GiveawayItem>()
+
         for (i in 0 until nodes.length()) {
             val node = nodes.getJSONObject(i)
-            val fields = fieldsMap(node.optJSONArray("fields"))
+            val title = node.optString("title", "Key drop")
 
+            if (EXCLUDED_TITLE_KEYWORDS.any { title.contains(it, ignoreCase = true) }) {
+                continue
+            }
+
+            val fields = fieldsMap(node.optJSONArray("fields"))
             val statusId = fields["status"]
+            val startInstant = fields["start_date"]?.let { parseInstant(it) }
+            val endInstant = fields["end_date"]?.let { parseInstant(it) }
+
+            // The relevant cutoff is end_date if Lenovo set one, otherwise
+            // start_date. If that cutoff is already in the past, skip it —
+            // regardless of what `status` claims.
+            val relevanceCutoff = endInstant ?: startInstant
+            if (relevanceCutoff != null && relevanceCutoff.isBefore(now)) {
+                continue
+            }
+
             val statusLabel = when (statusId) {
                 STATUS_ACTIVE -> "Active"
                 STATUS_COMING_SOON -> "Coming Soon"
+                STATUS_EXPIRED -> "Expired"
                 else -> null
             }
-            val startDateRaw = fields["start_date"]
-            val postedAt = startDateRaw?.let { formatDropDate(it) }
+
+            val postedAt = startInstant?.let { formatDropDate(it) }
+            val countdown = startInstant?.let { formatCountdown(now, it) }
+
+            val snippet = buildString {
+                append(statusLabel ?: "Key drop")
+                if (postedAt != null) {
+                    append(" — $postedAt")
+                    if (countdown != null) append(" ($countdown)")
+                } else {
+                    append(" — date not announced yet")
+                }
+            }
 
             items.add(
                 GiveawayItem(
                     sourceName = name,
                     id = node.optString("id"),
-                    title = node.optString("title", "Key drop"),
-                    snippet = statusLabel?.let { "$it${if (postedAt != null) " — starts $postedAt" else " — date not announced yet"}" }
-                        ?: "Tap to view details",
+                    title = title,
+                    snippet = snippet,
                     url = node.optString("url").ifBlank {
                         "https://gaming.lenovo.com/game-key-drops/post/${node.optString("slug")}"
                     },
@@ -174,15 +220,31 @@ class LenovoRepository(private val client: OkHttpClient) : GiveawaySource {
         return map
     }
 
-    /** Lenovo's start_date custom field is stored as an ISO-8601 instant. */
-    private fun formatDropDate(raw: String): String? {
-        return try {
-            val instant = Instant.parse(raw)
-            val formatter = DateTimeFormatter.ofPattern("MMM d, h:mm a")
-                .withZone(ZoneId.systemDefault())
-            formatter.format(instant)
+    private fun parseInstant(raw: String): Instant? =
+        try {
+            Instant.parse(raw)
         } catch (e: DateTimeParseException) {
-            null // fall back to no date rather than showing a raw/garbled string
+            null
+        }
+
+    private fun formatDropDate(instant: Instant): String {
+        val formatter = DateTimeFormatter.ofPattern("MMM d, h:mm a")
+            .withZone(ZoneId.systemDefault())
+        return formatter.format(instant)
+    }
+
+    /** One-off "time remaining" text computed at fetch time — not a live ticking clock. */
+    private fun formatCountdown(now: Instant, target: Instant): String? {
+        if (target.isBefore(now)) return null
+        val duration = Duration.between(now, target)
+        val days = duration.toDays()
+        val hours = duration.toHours() % 24
+        return when {
+            days > 0 -> "in ${days}d ${hours}h"
+            else -> {
+                val minutes = duration.toMinutes() % 60
+                "in ${hours}h ${minutes}m"
+            }
         }
     }
 
