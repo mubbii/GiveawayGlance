@@ -17,11 +17,12 @@ import org.json.JSONObject
  * on desktop) rather than the anonymous JSON endpoint. Keeping it anonymous
  * first because it's the simplest thing that could work.
  */
-class RedditRepository(private val client: OkHttpClient) {
+class RedditRepository(private val client: OkHttpClient) : GiveawaySource {
+
+    override val key = "reddit_gog_weekly"
+    override val name = "r/gog Weekly Giveaway"
 
     companion object {
-        const val SOURCE_KEY = "reddit_gog_weekly"
-        private const val SOURCE_NAME = "r/gog Weekly Giveaway"
         private const val SEARCH_URL =
             "https://www.reddit.com/r/gog/search.json" +
                 "?q=title:%22Weekly%20Code%20Giveaway%22" +
@@ -30,20 +31,20 @@ class RedditRepository(private val client: OkHttpClient) {
         private const val USER_AGENT = "android:com.mubbii.glance:v1.0 (by /u/mubbii)"
     }
 
-    fun fetchLatest(): GiveawayItem? {
+    override fun fetchLatest(): List<GiveawayItem> {
         val request = Request.Builder()
             .url(SEARCH_URL)
             .header("User-Agent", USER_AGENT)
             .build()
 
         client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return null
-            val body = response.body?.string() ?: return null
+            if (!response.isSuccessful) return emptyList()
+            val body = response.body?.string() ?: return emptyList()
 
             val children = JSONObject(body)
                 .getJSONObject("data")
                 .getJSONArray("children")
-            if (children.length() == 0) return null
+            if (children.length() == 0) return emptyList()
 
             // children are already sorted "new" by the query; take the first.
             val post = children.getJSONObject(0).getJSONObject("data")
@@ -52,12 +53,14 @@ class RedditRepository(private val client: OkHttpClient) {
             val author = post.optString("author", "unknown")
             val permalink = post.getString("permalink")
 
-            return GiveawayItem(
-                sourceName = SOURCE_NAME,
-                id = id,
-                title = title,
-                snippet = "Posted by u/$author",
-                url = "https://www.reddit.com$permalink"
+            return listOf(
+                GiveawayItem(
+                    sourceName = name,
+                    id = id,
+                    title = title,
+                    snippet = "Posted by u/$author",
+                    url = "https://www.reddit.com$permalink"
+                )
             )
         }
     }

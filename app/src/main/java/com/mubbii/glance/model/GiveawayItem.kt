@@ -11,6 +11,7 @@ data class GiveawayItem(
     val title: String,           // headline text shown on the card
     val snippet: String,         // secondary line (author, excerpt, date)
     val url: String,             // opens in browser on tap
+    val postedAt: String? = null, // human-readable post time, when the source exposes one
     val isNew: Boolean = false   // set by the ViewModel after comparing to SeenStore
 )
 

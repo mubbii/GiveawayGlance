@@ -146,6 +146,14 @@ private fun GiveawayCard(item: GiveawayItem) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 SourceChip(item.sourceName)
+                item.postedAt?.let {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 Spacer(Modifier.weight(1f))
                 if (item.isNew) NewBadge()
             }
