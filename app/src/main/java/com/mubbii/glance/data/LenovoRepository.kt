@@ -207,7 +207,12 @@ class LenovoRepository(private val client: OkHttpClient) : GiveawaySource {
                 )
             )
         }
-        return items
+        // Only the single soonest upcoming/current drop — that's the "next
+        // giveaway" you actually check for, not every technically-future
+        // entry. The API query already sorts ascending by start_date, and
+        // filtering above preserves that order, so the first surviving
+        // item is the soonest one.
+        return items.take(1)
     }
 
     private fun fieldsMap(fields: JSONArray?): Map<String, String> {
@@ -222,9 +227,22 @@ class LenovoRepository(private val client: OkHttpClient) : GiveawaySource {
 
     private fun parseInstant(raw: String): Instant? =
         try {
+            // Preferred: a real instant/offset format (e.g. ends in Z).
             Instant.parse(raw)
         } catch (e: DateTimeParseException) {
-            null
+            try {
+                // What Lenovo actually sends: "2026-09-23T16:00:00" — a
+                // local date-time with NO offset at all. Instant.parse()
+                // rejects this outright (that was the bug: it silently
+                // returned null here, which both blanked the date/countdown
+                // AND accidentally let already-past drops slip through,
+                // since a null cutoff skipped the "already passed" check
+                // entirely). Confirmed against a real screenshot that this
+                // value is meant as UTC, not local time.
+                java.time.LocalDateTime.parse(raw).toInstant(java.time.ZoneOffset.UTC)
+            } catch (e2: DateTimeParseException) {
+                null
+            }
         }
 
     private fun formatDropDate(instant: Instant): String {
@@ -239,13 +257,8 @@ class LenovoRepository(private val client: OkHttpClient) : GiveawaySource {
         val duration = Duration.between(now, target)
         val days = duration.toDays()
         val hours = duration.toHours() % 24
-        return when {
-            days > 0 -> "in ${days}d ${hours}h"
-            else -> {
-                val minutes = duration.toMinutes() % 60
-                "in ${hours}h ${minutes}m"
-            }
-        }
+        val minutes = duration.toMinutes() % 60
+        return if (days > 0) "in ${days}d ${hours}h ${minutes}m" else "in ${hours}h ${minutes}m"
     }
 
     private fun post(body: JSONObject, accessToken: String? = null): JSONObject? {
