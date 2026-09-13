@@ -220,10 +220,29 @@ class LenovoRepository(private val client: OkHttpClient) : GiveawaySource {
         val map = mutableMapOf<String, String>()
         for (i in 0 until fields.length()) {
             val field = fields.getJSONObject(i)
-            map[field.optString("key")] = field.optString("value")
+            map[field.optString("key")] = unwrapFieldValue(field.optString("value"))
         }
         return map
     }
+
+    /**
+     * Bettermode stores each custom field's `value` as a JSON-encoded
+     * string — so a status ID or date comes through as literally
+     * `"AmAI_EO502mWht5Fb6OE0"` or `"2026-06-04T16:00:00"`, quote
+     * characters included, not the bare value. That's what was actually
+     * breaking both the status-label lookup AND the date parsing (both
+     * failed the same way: comparing/parsing a string that still had its
+     * surrounding quotes attached). This unwraps that one layer of JSON
+     * encoding; if a value ever comes through NOT quoted (already bare),
+     * parsing it as JSON just fails and this falls back to the raw text
+     * unchanged, so it's safe either way.
+     */
+    private fun unwrapFieldValue(raw: String): String =
+        try {
+            org.json.JSONTokener(raw).nextValue().toString()
+        } catch (e: Exception) {
+            raw
+        }
 
     private fun parseInstant(raw: String): Instant? =
         try {
